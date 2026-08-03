@@ -24,14 +24,14 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
           components: clippy
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Cargo check
         run: cargo check --all-targets
       - name: Cargo clippy
@@ -44,7 +44,7 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup Rust toolchain
         # We use nightly options in rustfmt.toml
         uses: dtolnay/rust-toolchain@nightly
@@ -58,11 +58,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install cbindgen
         run: cargo install cbindgen
       - name: Generate header
@@ -84,7 +84,7 @@ jobs:
     # Prevent new advisories from failing CI
     continue-on-error: ${{ matrix.checks == 'advisories' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check ${{ matrix.checks }}
@@ -98,11 +98,11 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Cargo test
         run: cargo test --release
 
@@ -160,7 +160,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install dependencies
         if: matrix.packages != ''
         run: |
@@ -174,13 +174,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Cargo build
         run: >
           cargo ${{ matrix.build }} --profile ${{ env.BUILD_PROFILE }} --target ${{ matrix.target }}
           --bin ${{ env.CARGO_BIN_NAME }} --features ${{ matrix.features }}
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.CARGO_BIN_NAME }}-${{ matrix.name }}
           path: |
@@ -203,11 +203,11 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         if: startsWith(matrix.platform, 'windows-')
@@ -220,7 +220,7 @@ jobs:
       - name: Package
         run: tar czf libnod-${{ matrix.name }}.tar.gz -C install .
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libnod-${{ matrix.name }}
           path: libnod-${{ matrix.name }}.tar.gz
@@ -233,11 +233,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install cargo-vendor-filterer
         run: cargo install --locked cargo-vendor-filterer
       - name: Generate vendored crates archive
@@ -248,7 +248,7 @@ jobs:
           cargo vendor-filterer > .cargo/config.toml
           find .cargo vendor -type f | tar -cavf vendored-crates.tar.zst -T -
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vendored-crates.tar.zst
           path: vendored-crates.tar.zst
@@ -262,7 +262,7 @@ jobs:
     needs: [ build, build-libs, cargo-vendor ]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Check git tag against Cargo version
         shell: bash
         run: |
@@ -276,7 +276,7 @@ jobs:
             exit 1
           fi
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Rename artifacts
