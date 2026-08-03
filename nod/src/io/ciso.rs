@@ -15,8 +15,8 @@ use crate::{
         SECTOR_SIZE,
         reader::DiscReader,
         writer::{
-            BlockProcessor, BlockResult, CheckBlockResult, DiscWriter, check_block, par_process,
-            read_block,
+            BlockProcessor, BlockResult, CheckBlockResult, DiscWriter, PartitionUsage, check_block,
+            par_process, read_block,
         },
     },
     io::{
@@ -143,6 +143,7 @@ impl BlockReader for BlockReaderCISO {
 struct BlockProcessorCISO {
     inner: DiscReader,
     block_size: u32,
+    partition_usage: Arc<[PartitionUsage]>,
     decrypted_block: Box<[u8]>,
     lfg: LaggedFibonacci,
     disc_id: [u8; 4],
@@ -155,6 +156,7 @@ impl Clone for BlockProcessorCISO {
         Self {
             inner: self.inner.clone(),
             block_size: self.block_size,
+            partition_usage: self.partition_usage.clone(),
             decrypted_block: <[u8]>::new_box_zeroed_with_elems(self.block_size as usize).unwrap(),
             lfg: LaggedFibonacci::default(),
             disc_id: self.disc_id,
@@ -179,6 +181,7 @@ impl BlockProcessor for BlockProcessorCISO {
             &mut self.decrypted_block,
             input_position,
             self.inner.partitions(),
+            &self.partition_usage,
             &mut self.lfg,
             self.disc_id,
             self.disc_num,
@@ -251,6 +254,10 @@ impl DiscWriter for DiscWriterCISO {
         let disc_id = *array_ref![disc_header.game_id, 0, 4];
         let disc_num = disc_header.disc_num;
 
+        // Build each partition's usage map once, rather than per block
+        let partition_usage: Arc<[PartitionUsage]> =
+            self.inner.partitions().iter().map(PartitionUsage::new).collect();
+
         // Create hashers
         let digest = DigestManager::new(options);
         let block_size = self.block_size;
@@ -265,6 +272,7 @@ impl DiscWriter for DiscWriterCISO {
             BlockProcessorCISO {
                 inner: self.inner.clone(),
                 block_size,
+                partition_usage,
                 decrypted_block: <[u8]>::new_box_zeroed_with_elems(block_size as usize).unwrap(),
                 lfg: LaggedFibonacci::default(),
                 disc_id,

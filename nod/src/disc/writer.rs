@@ -1,6 +1,7 @@
 use std::{
     io,
     io::{BufRead, Read},
+    ops::Range,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -192,10 +193,57 @@ where
 }
 
 /// The determined block type.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CheckBlockResult {
     Normal,
     Zeroed,
     Junk,
+}
+
+/// Stores the byte ranges within a partition's data area that contain real disc
+/// content. Derived from the partition structure and FST rather than inspecting
+/// block data, because block data may be zeroed or match the junk fill pattern.
+pub(crate) struct PartitionUsage {
+    ranges: Option<Vec<Range<u64>>>,
+}
+
+impl PartitionUsage {
+    pub(crate) fn new(partition: &PartitionInfo) -> Self {
+        let Some(fst) = partition.fst() else {
+            return Self { ranges: None };
+        };
+        let is_wii = partition.disc_header().is_wii();
+        let boot_header = partition.boot_header();
+
+        let mut ranges = Vec::new();
+        // Conservatively protect everything up to the end of the FST
+        let system_end = boot_header.fst_offset(is_wii) + boot_header.fst_size(is_wii);
+        ranges.push(0..system_end);
+
+        for &node in fst.nodes {
+            if !node.is_file() {
+                continue;
+            }
+            let start = node.offset(is_wii);
+            ranges.push(start..start + node.length() as u64);
+        }
+
+        ranges.sort_unstable_by_key(|r| r.start);
+        let mut merged: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        Self { ranges: Some(merged) }
+    }
+
+    fn overlaps_used(&self, start: u64, end: u64) -> bool {
+        let Some(ranges) = &self.ranges else { return false };
+        let idx = ranges.partition_point(|r| r.end <= start);
+        ranges.get(idx).is_some_and(|r| r.start < end)
+    }
 }
 
 /// Check if a block is zeroed or junk data.
@@ -205,6 +253,7 @@ pub(crate) fn check_block(
     decrypted_block: &mut [u8],
     input_position: u64,
     partition_info: &[PartitionInfo],
+    partition_usage: &[PartitionUsage],
     lfg: &mut LaggedFibonacci,
     disc_id: [u8; 4],
     disc_num: u8,
@@ -212,7 +261,7 @@ pub(crate) fn check_block(
 ) -> io::Result<CheckBlockResult> {
     let start_sector = (input_position / SECTOR_SIZE as u64) as u32;
     let end_sector = ((input_position + buf.len() as u64) / SECTOR_SIZE as u64) as u32;
-    if let Some(partition) = partition_info.iter().find(|p| {
+    if let Some((partition_idx, partition)) = partition_info.iter().enumerate().find(|(_, p)| {
         p.has_hashes && start_sector >= p.data_start_sector && end_sector < p.data_end_sector
     }) {
         // Ignore update partition data
@@ -241,24 +290,31 @@ pub(crate) fn check_block(
         } else {
             buf
         };
-        if sector_data_iter(block).all(|sector_data| sector_data.iter().all(|&b| b == 0)) {
-            return Ok(CheckBlockResult::Zeroed);
-        }
+
         let partition_start = partition.data_start_sector as u64 * SECTOR_SIZE as u64;
         let partition_offset =
             ((input_position - partition_start) / SECTOR_SIZE as u64) * SECTOR_DATA_SIZE as u64;
-        // Junk data within a partition is seeded from the partition's own disc header, which is
-        // also what junk regeneration uses at read time. It usually matches the outer disc
-        // header, but nothing guarantees that.
-        let partition_header = partition.disc_header();
-        let disc_id = *array_ref![partition_header.game_id, 0, 4];
-        let disc_num = partition_header.disc_num;
-        if sector_data_iter(block).enumerate().all(|(i, sector_data)| {
-            let sector_offset = partition_offset + i as u64 * SECTOR_DATA_SIZE as u64;
-            lfg.check_sector_chunked(sector_data, disc_id, disc_num, sector_offset)
-                == sector_data.len()
-        }) {
-            return Ok(CheckBlockResult::Junk);
+        let num_sectors = block.len() as u64 / SECTOR_SIZE as u64;
+        let block_end = partition_offset + num_sectors * SECTOR_DATA_SIZE as u64;
+
+        // Only drop blocks outside of used ranges, regardless of content
+        if !partition_usage[partition_idx].overlaps_used(partition_offset, block_end) {
+            if sector_data_iter(block).all(|sector_data| sector_data.iter().all(|&b| b == 0)) {
+                return Ok(CheckBlockResult::Zeroed);
+            }
+            // Junk data within a partition is seeded from the partition's own disc header,
+            // which is also what junk regeneration uses at read time. It usually matches the
+            // outer disc header, but nothing guarantees that.
+            let partition_header = partition.disc_header();
+            let disc_id = *array_ref![partition_header.game_id, 0, 4];
+            let disc_num = partition_header.disc_num;
+            if sector_data_iter(block).enumerate().all(|(i, sector_data)| {
+                let sector_offset = partition_offset + i as u64 * SECTOR_DATA_SIZE as u64;
+                lfg.check_sector_chunked(sector_data, disc_id, disc_num, sector_offset)
+                    == sector_data.len()
+            }) {
+                return Ok(CheckBlockResult::Junk);
+            }
         }
     } else {
         if buf.iter().all(|&b| b == 0) {
@@ -320,15 +376,17 @@ mod tests {
 
     fn run_check_block(buf: &[u8], partition: &PartitionInfo) -> CheckBlockResult {
         let mut decrypted = vec![0u8; buf.len()];
+        let partition_usage = [PartitionUsage::new(partition)];
         check_block(
             buf,
             &mut decrypted,
             0,
             std::slice::from_ref(partition),
+            &partition_usage,
             &mut LaggedFibonacci::default(),
             OUTER_ID,
             0,
-            false,
+            None,
         )
         .unwrap()
     }
