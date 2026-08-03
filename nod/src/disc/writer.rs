@@ -1,11 +1,12 @@
 use std::{
     io,
-    io::{BufRead, Read},
+    io::{BufRead, Read, Seek, SeekFrom},
     ops::Range,
 };
 
 use bytes::{Bytes, BytesMut};
 use dyn_clone::DynClone;
+use zerocopy::FromBytes;
 
 use crate::{
     Result, ResultContext,
@@ -13,7 +14,7 @@ use crate::{
     disc::{
         SECTOR_SIZE,
         reader::DiscReader,
-        wii::{HASHES_SIZE, SECTOR_DATA_SIZE},
+        wii::{HASHES_SIZE, SECTOR_DATA_SIZE, WII_PART_GROUP_OFF, WiiPartEntry, WiiPartGroup},
     },
     util::{aes::decrypt_sector_b2b, array_ref, array_ref_mut, lfg::LaggedFibonacci},
     write::{DataCallback, DiscFinalization, DiscWriterWeight, ProcessOptions},
@@ -246,7 +247,85 @@ impl PartitionUsage {
     }
 }
 
-/// Check if a block is zeroed or junk data.
+/// Used when scrubbing a partition, so the output doesn't claim to still
+/// have a real partition where the data has been discarded.
+pub(crate) struct PartitionRemoval {
+    edits: Vec<(u64, Vec<u8>)>,
+}
+
+impl PartitionRemoval {
+    pub(crate) fn new(disc: &mut DiscReader, kind: PartitionKind) -> io::Result<Option<Self>> {
+        if !disc.header().is_wii() {
+            return Ok(None);
+        }
+
+        disc.seek(SeekFrom::Start(WII_PART_GROUP_OFF))?;
+        let mut group_buf = [0u8; 32]; // 4 groups * 8 bytes each
+        disc.read_exact(&mut group_buf)?;
+
+        let mut edits = Vec::new();
+        for group_idx in 0..4u64 {
+            let group_bytes = &group_buf[group_idx as usize * 8..group_idx as usize * 8 + 8];
+            let group = WiiPartGroup::read_from_bytes(group_bytes)
+                .map_err(|_| io::Error::other("Invalid partition group"))?;
+            let part_count = group.part_count.get();
+            if part_count == 0 {
+                continue;
+            }
+            let entry_off = group.part_entry_off();
+            disc.seek(SeekFrom::Start(entry_off))?;
+            let mut entry_buf = vec![0u8; part_count as usize * 8];
+            disc.read_exact(&mut entry_buf)?;
+
+            let mut removed_idx = None;
+            for i in 0..part_count as usize {
+                let entry = WiiPartEntry::read_from_bytes(&entry_buf[i * 8..i * 8 + 8])
+                    .map_err(|_| io::Error::other("Invalid partition entry"))?;
+                if PartitionKind::from(entry.kind.get()) == kind {
+                    removed_idx = Some(i);
+                    break;
+                }
+            }
+            let Some(removed_idx) = removed_idx else { continue };
+
+            let new_count = part_count - 1;
+            edits.push((WII_PART_GROUP_OFF + group_idx * 8, new_count.to_be_bytes().to_vec()));
+
+            // Shift every entry after the removed one back by one slot
+            let remaining = entry_buf[(removed_idx + 1) * 8..part_count as usize * 8].to_vec();
+            if !remaining.is_empty() {
+                edits.push((entry_off + removed_idx as u64 * 8, remaining));
+            }
+        }
+
+        if edits.is_empty() { Ok(None) } else { Ok(Some(Self { edits })) }
+    }
+
+    pub(crate) fn overlaps(&self, block_start: u64, block_len: u64) -> bool {
+        let block_end = block_start + block_len;
+        self.edits
+            .iter()
+            .any(|(offset, data)| *offset < block_end && offset + data.len() as u64 > block_start)
+    }
+
+    pub(crate) fn apply(&self, block: &mut [u8], block_start: u64) {
+        let block_end = block_start + block.len() as u64;
+        for (offset, data) in &self.edits {
+            let edit_end = offset + data.len() as u64;
+            if *offset >= block_end || edit_end <= block_start {
+                continue;
+            }
+            let overlap_start = (*offset).max(block_start);
+            let overlap_end = edit_end.min(block_end);
+            let src = (overlap_start - offset) as usize..(overlap_end - offset) as usize;
+            let dst = (overlap_start - block_start) as usize..(overlap_end - block_start) as usize;
+            block[dst].copy_from_slice(&data[src]);
+        }
+    }
+}
+
+/// Check if a block is zeroed, junk data, or safe to drop because it
+/// belongs to a partition being scrubbed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_block(
     buf: &[u8],
@@ -257,18 +336,72 @@ pub(crate) fn check_block(
     lfg: &mut LaggedFibonacci,
     disc_id: [u8; 4],
     disc_num: u8,
-    scrub_update_partition: bool,
+    scrub_partition_kind: Option<PartitionKind>,
 ) -> io::Result<CheckBlockResult> {
     let start_sector = (input_position / SECTOR_SIZE as u64) as u32;
     let end_sector = ((input_position + buf.len() as u64) / SECTOR_SIZE as u64) as u32;
+
+    // A block fully inside the scrubbed partition(s) can be dropped outright.
+    // A block that only partially overlaps can still be dropped, but only
+    // if the leftover is droppable, and isn't part of a different partition.
+    if let Some(kind) = scrub_partition_kind {
+        let mut covered: Vec<Range<u32>> = partition_info
+            .iter()
+            .filter(|p| p.kind == kind)
+            .map(|p| p.start_sector.max(start_sector)..p.data_end_sector.min(end_sector))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if !covered.is_empty() {
+            covered.sort_by_key(|r| r.start);
+            let mut merged: Vec<Range<u32>> = Vec::with_capacity(covered.len());
+            for r in covered {
+                match merged.last_mut() {
+                    Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                    _ => merged.push(r),
+                }
+            }
+
+            if merged.len() == 1 && merged[0].start <= start_sector && merged[0].end >= end_sector {
+                return Ok(CheckBlockResult::Zeroed);
+            }
+
+            let mut leftover_droppable = |range: Range<u32>| -> bool {
+                if range.is_empty() {
+                    return true;
+                }
+                if partition_info.iter().any(|p| {
+                    p.kind != kind && range.start < p.data_end_sector && range.end > p.start_sector
+                }) {
+                    return false;
+                }
+                let rel_start = (range.start - start_sector) as usize * SECTOR_SIZE;
+                let rel_end = (range.end - start_sector) as usize * SECTOR_SIZE;
+                let chunk = &buf[rel_start..rel_end];
+                if chunk.iter().all(|&b| b == 0) {
+                    return true;
+                }
+                let chunk_pos = input_position + rel_start as u64;
+                lfg.check_sector_chunked(chunk, disc_id, disc_num, chunk_pos) == chunk.len()
+            };
+
+            let mut cursor = start_sector;
+            let mut ok = true;
+            for r in &merged {
+                if !leftover_droppable(cursor..r.start) {
+                    ok = false;
+                    break;
+                }
+                cursor = r.end;
+            }
+            if ok && leftover_droppable(cursor..end_sector) {
+                return Ok(CheckBlockResult::Zeroed);
+            }
+        }
+    }
+
     if let Some((partition_idx, partition)) = partition_info.iter().enumerate().find(|(_, p)| {
         p.has_hashes && start_sector >= p.data_start_sector && end_sector < p.data_end_sector
     }) {
-        // Ignore update partition data
-        if scrub_update_partition && partition.kind == PartitionKind::Update {
-            return Ok(CheckBlockResult::Zeroed);
-        }
-
         if input_position % SECTOR_SIZE as u64 != 0 {
             return Err(io::Error::other("Partition block not aligned to sector boundary"));
         }

@@ -10,13 +10,13 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_e
 
 use crate::{
     Error, Result, ResultContext,
-    common::{Compression, Format, MagicBytes},
+    common::{Compression, Format, MagicBytes, PartitionKind},
     disc::{
         SECTOR_SIZE,
         reader::DiscReader,
         writer::{
-            BlockProcessor, BlockResult, CheckBlockResult, DiscWriter, PartitionUsage, check_block,
-            par_process, read_block,
+            BlockProcessor, BlockResult, CheckBlockResult, DiscWriter, PartitionRemoval,
+            PartitionUsage, check_block, par_process, read_block,
         },
     },
     io::{
@@ -144,11 +144,12 @@ struct BlockProcessorCISO {
     inner: DiscReader,
     block_size: u32,
     partition_usage: Arc<[PartitionUsage]>,
+    partition_removal: Option<Arc<PartitionRemoval>>,
     decrypted_block: Box<[u8]>,
     lfg: LaggedFibonacci,
     disc_id: [u8; 4],
     disc_num: u8,
-    scrub_update_partition: bool,
+    scrub_partition_kind: Option<PartitionKind>,
 }
 
 impl Clone for BlockProcessorCISO {
@@ -157,11 +158,12 @@ impl Clone for BlockProcessorCISO {
             inner: self.inner.clone(),
             block_size: self.block_size,
             partition_usage: self.partition_usage.clone(),
+            partition_removal: self.partition_removal.clone(),
             decrypted_block: <[u8]>::new_box_zeroed_with_elems(self.block_size as usize).unwrap(),
             lfg: LaggedFibonacci::default(),
             disc_id: self.disc_id,
             disc_num: self.disc_num,
-            scrub_update_partition: self.scrub_update_partition,
+            scrub_partition_kind: self.scrub_partition_kind,
         }
     }
 }
@@ -175,6 +177,19 @@ impl BlockProcessor for BlockProcessorCISO {
         self.inner.seek(SeekFrom::Start(input_position))?;
         let (block_data, disc_data) = read_block(&mut self.inner, block_size)?;
 
+        // If this block holds part of the scrubbed partition's table entry,
+        // remove it. Other partitions are left untouched.
+        let (block_data, disc_data) = match &self.partition_removal {
+            Some(patch) if patch.overlaps(input_position, block_data.len() as u64) => {
+                let mut buf = BytesMut::from(block_data.as_ref());
+                patch.apply(&mut buf, input_position);
+                let block_data = buf.freeze();
+                let disc_data = block_data.slice(0..disc_data.len());
+                (block_data, disc_data)
+            }
+            _ => (block_data, disc_data),
+        };
+
         // Check if block is zeroed or junk
         let result = match check_block(
             disc_data.as_ref(),
@@ -185,7 +200,7 @@ impl BlockProcessor for BlockProcessorCISO {
             &mut self.lfg,
             self.disc_id,
             self.disc_num,
-            self.scrub_update_partition,
+            self.scrub_partition_kind,
         )? {
             CheckBlockResult::Normal => {
                 BlockResult { block_idx, disc_data, block_data, meta: CheckBlockResult::Normal }
@@ -258,6 +273,19 @@ impl DiscWriter for DiscWriterCISO {
         let partition_usage: Arc<[PartitionUsage]> =
             self.inner.partitions().iter().map(PartitionUsage::new).collect();
 
+        // Remove the partition table entry when scrubbing
+        let scrub_enabled = options.scrub == ScrubLevel::UpdatePartition;
+        let scrub_partition_kind = scrub_enabled.then_some(PartitionKind::Update);
+        let partition_removal: Option<Arc<PartitionRemoval>> =
+            if let Some(kind) = scrub_partition_kind {
+                let mut disc = self.inner.clone();
+                PartitionRemoval::new(&mut disc, kind)
+                    .context("Building partition removal")?
+                    .map(Arc::new)
+            } else {
+                None
+            };
+
         // Create hashers
         let digest = DigestManager::new(options);
         let block_size = self.block_size;
@@ -273,11 +301,12 @@ impl DiscWriter for DiscWriterCISO {
                 inner: self.inner.clone(),
                 block_size,
                 partition_usage,
+                partition_removal,
                 decrypted_block: <[u8]>::new_box_zeroed_with_elems(block_size as usize).unwrap(),
                 lfg: LaggedFibonacci::default(),
                 disc_id,
                 disc_num,
-                scrub_update_partition: options.scrub == ScrubLevel::UpdatePartition,
+                scrub_partition_kind,
             },
             self.block_count,
             #[cfg(feature = "threading")]
